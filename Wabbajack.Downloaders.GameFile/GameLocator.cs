@@ -18,6 +18,12 @@ namespace Wabbajack.Downloaders.GameFile;
 
 public class GameLocator : IGameLocator
 {
+    private static readonly RelativePath[] OverrideConfigFileNames =
+    {
+        "game-location-overrides.txt".ToRelativePath(),
+        "game-location-overrides.ini".ToRelativePath()
+    };
+
     private readonly SteamHandler _steam;
     private readonly GOGHandler? _gog;
     private readonly EGSHandler? _egs;
@@ -29,6 +35,7 @@ public class GameLocator : IGameLocator
     private readonly Dictionary<EGSGameId, AbsolutePath> _egsGames = new();
     private readonly Dictionary<OriginGameId, AbsolutePath> _originGames = new();
     private readonly Dictionary<EADesktopGameId, AbsolutePath> _eaDesktopGames = new();
+    private readonly Dictionary<Game, AbsolutePath> _manualOverrides = new();
     
     private readonly Dictionary<Game, AbsolutePath> _locationCache;
     private readonly ILogger<GameLocator> _logger;
@@ -55,7 +62,139 @@ public class GameLocator : IGameLocator
 
         _locationCache = new Dictionary<Game, AbsolutePath>();
 
+        LoadManualOverrides();
         FindAllGames();
+    }
+
+    private void LoadManualOverrides()
+    {
+        var candidateFiles = OverrideConfigFileNames
+            .SelectMany(fileName => new[]
+            {
+                KnownFolders.WabbajackAppLocal.Combine(fileName),
+                KnownFolders.EntryPoint.Combine(fileName)
+            })
+            .Distinct()
+            .ToArray();
+
+        foreach (var file in candidateFiles)
+        {
+            if (!file.FileExists())
+                continue;
+
+            try
+            {
+                ParseManualOverrideFile(file);
+            }
+            catch (Exception e)
+            {
+                _logger.LogError(e, "While loading game location override file {File}", file);
+            }
+        }
+    }
+
+    private void ParseManualOverrideFile(AbsolutePath file)
+    {
+        var lineNumber = 0;
+        foreach (var rawLine in file.ReadAllLines())
+        {
+            lineNumber++;
+            var line = rawLine.Trim();
+
+            if (string.IsNullOrWhiteSpace(line) || line.StartsWith('#') || line.StartsWith(';'))
+                continue;
+
+            var separatorIndex = line.IndexOf('=');
+            if (separatorIndex <= 0 || separatorIndex >= line.Length - 1)
+            {
+                _logger.LogWarning(
+                    "Invalid game location override at {File}:{Line}. Expected Game=Path format.",
+                    file,
+                    lineNumber);
+                continue;
+            }
+
+            var gamePart = line[..separatorIndex].Trim();
+            var pathPart = line[(separatorIndex + 1)..].Trim().Trim('"');
+
+            if (!TryParseGame(gamePart, out var game))
+            {
+                _logger.LogWarning(
+                    "Unknown game '{Game}' in override at {File}:{Line}",
+                    gamePart,
+                    file,
+                    lineNumber);
+                continue;
+            }
+
+            if (!TryNormalizeManualPath(pathPart, out var gameFolder))
+            {
+                _logger.LogWarning(
+                    "Path '{Path}' in override for {Game} does not exist ({File}:{Line})",
+                    pathPart,
+                    game,
+                    file,
+                    lineNumber);
+                continue;
+            }
+
+            var mainExecutable = game.MetaData().MainExecutable;
+            if (mainExecutable is null || !mainExecutable.Value.RelativeTo(gameFolder).FileExists())
+            {
+                _logger.LogWarning(
+                    "Path '{Path}' in override for {Game} is missing expected main executable '{Exe}' ({File}:{Line})",
+                    gameFolder,
+                    game,
+                    mainExecutable?.ToString() ?? "<none>",
+                    file,
+                    lineNumber);
+                continue;
+            }
+
+            _manualOverrides[game] = gameFolder;
+            _logger.LogInformation("Using manual override for {Game}: {Path}", game, gameFolder);
+        }
+    }
+
+    private static bool TryParseGame(string gameName, out Game game)
+    {
+        if (Enum.TryParse(gameName, true, out game))
+            return true;
+
+        foreach (var kvp in GameRegistry.Games)
+        {
+            if (!string.Equals(kvp.Value.HumanFriendlyGameName, gameName, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            game = kvp.Key;
+            return true;
+        }
+
+        game = default;
+        return false;
+    }
+
+    private static bool TryNormalizeManualPath(string path, out AbsolutePath gameFolder)
+    {
+        gameFolder = default;
+        if (string.IsNullOrWhiteSpace(path))
+            return false;
+
+        var absolutePath = path.ToAbsolutePath();
+
+        if (absolutePath.FileExists())
+        {
+            gameFolder = absolutePath.Parent;
+            return gameFolder.DirectoryExists();
+        }
+
+        if (absolutePath.DirectoryExists())
+        {
+            gameFolder = absolutePath;
+            return true;
+        }
+
+        return false;
     }
 
     private void FindAllGames()
@@ -173,6 +312,12 @@ public class GameLocator : IGameLocator
 
     private bool TryFindLocationInner(Game game, out AbsolutePath path)
     {
+        if (_manualOverrides.TryGetValue(game, out var manualOverride))
+        {
+            path = manualOverride;
+            return true;
+        }
+
         var metaData = game.MetaData();
 
         foreach (var id in metaData.SteamIDs)
